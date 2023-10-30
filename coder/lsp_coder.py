@@ -246,24 +246,31 @@ class LSPCoder:
             for idx, children in enumerate(children_list):
                 tau_x.extend([idx] * len(children))
                 tau_y.extend([node.key for node in children])
-            tau[tau_x, tau_y] = temperature
-            logits /= tau
+            tau[tau_x, tau_y] = 1 / temperature
+            logits *= tau
             probs = torch.softmax(logits, -1)
             logprobs = torch.log(probs)
             # probs = logits_processor(tmp_decoder_input_ids, probs)
-            topk_probs, topk_idxs = probs.topk(token_k, -1, True, True)
 
             next_token_ids_list = []
             next_token_probs_list = []
             next_token_logprobs_list = []
             new_pending_nodes = []
-            for k, (_children, _probs, _logprobs, _topk_probs, _topk_idxs) in enumerate(zip(children_list, probs, logprobs, topk_probs, topk_idxs)):
-                topk_tokens_with_probs = [(self.generator.tokenizer._convert_id_to_token(_idx.item()), round(_prob.item(), 4)) for _prob, _idx in zip(_topk_probs, _topk_idxs)]
-                topk_tokens_with_probs.sort(key=lambda x: x[-1], reverse=True)
+            for k, (_children, _probs, _logprobs) in enumerate(zip(children_list, probs, logprobs)):
+                _children.sort(key=lambda child_node: _probs[child_node.key].item(), reverse=True)
+                logging.info('\t' * step + f"group: {i}")
+                for child_node in _children:
+                    logging.info('\t' * step + f"token: {self.generator.tokenizer.convert_ids_to_tokens([child_node.key])[0]}, prob: {_probs[child_node.key].item()}")
+                _children = _children[:cand_num]
+                if token_k:
+                    _topk_probs, _topk_idxs = probs.topk(token_k, -1, True, True)
+                    _topk_idxs = {_idx.item() for _idx in _topk_idxs}
+                    topk_tokens_with_probs = [(self.generator.tokenizer.convert_ids_to_tokens([_idx.item()])[0], round(_prob.item(), 4)) for _prob, _idx in zip(_topk_probs, _topk_idxs)]
+                    topk_tokens_with_probs.sort(key=lambda x: x[-1], reverse=True)
                 
                 next_token_ids, next_token_probs, next_token_logprobs = [], [], []
                 for child_node in _children:
-                    if _probs[child_node.key].item() < token_threshold or child_node.key not in {_idx.item() for _idx in _topk_idxs}:
+                    if _probs[child_node.key].item() < token_threshold or (token_k and child_node.key not in _topk_idxs):
                         pending_nodes[k].remove_child(child_node.key)
                         continue
                     # child_node.set_score(_probs[child_node.key].item())

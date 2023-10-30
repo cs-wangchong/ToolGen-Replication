@@ -279,7 +279,7 @@ class LSPCoder:
                 break
 
             new_lsp_decoder_input_ids = []
-            for i, (next_token_ids, next_token_probs) in enumerate(zip(next_token_ids_list, next_token_probs_list)):
+            for i, next_token_ids in enumerate(next_token_ids_list):
                 if len(next_token_ids) == 0:
                     continue
                 expanded_rows = lsp_decoder_input_ids[i:i+1].repeat(len(next_token_ids), 1)
