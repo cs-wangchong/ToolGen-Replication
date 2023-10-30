@@ -258,9 +258,9 @@ class LSPCoder:
             new_pending_nodes = []
             for k, (_children, _probs, _logprobs) in enumerate(zip(children_list, probs, logprobs)):
                 _children.sort(key=lambda child_node: _probs[child_node.key].item(), reverse=True)
-                logging.info('\t' * step + f"group: {i}")
-                for child_node in _children:
-                    logging.info('\t' * step + f"token: {self.generator.tokenizer.convert_ids_to_tokens([child_node.key])[0]}, prob: {_probs[child_node.key].item()}")
+                # logging.info('\t' * step + f"group: {i}")
+                # for child_node in _children:
+                #     logging.info('\t' * step + f"token: {self.generator.tokenizer.convert_ids_to_tokens([child_node.key])[0]}, prob: {_probs[child_node.key].item()}")
                 _children = _children[:cand_num]
                 if token_k:
                     _topk_probs, _topk_idxs = probs.topk(token_k, -1, True, True)
@@ -374,6 +374,9 @@ class LSPCoder:
             temperature=0.6,
             repetition_penalty=1.0,
         ):
+        if token_k:
+            token_k = min(token_k, len(self.generator.tokenizer))
+
         source_ids = self.generator.tokenizer([desc], add_special_tokens=True, padding=True, truncation=True, return_tensors="pt").input_ids
         source_ids = source_ids.to(self.device)
         attention_mask = source_ids.ne(self.generator.tokenizer.pad_token_id)
@@ -472,7 +475,7 @@ class LSPCoder:
             
             if not bank:
                 break
-            beam_decoding_ids, beam_past_key_values, beam_probs, beam_scores = self._select_from_bank(bank, beam_size, verbose=expanded)
+            beam_decoding_ids, beam_past_key_values, beam_probs, beam_scores = self._select_from_bank(bank, beam_size, verbose=False)
 
         # for l, (tmp_generated_ids, tmp_decoder_input_ids, tmp_past_key_values, tmp_scores) in bank.items():
         #     for ids, s in zip(tmp_generated_ids, tmp_scores):
@@ -489,9 +492,9 @@ class LSPCoder:
         final_generations = []
         logging.info(f"[PREDICTIONS]")
         for idx, (ids, s) in enumerate(final_generation_ids, 1):
-            logging.info(f"Prediction {idx}, socre: {s}")
-            logging.info(f"\n{self.generator.tokenizer.decode(ids, skip_special_tokens=True).strip()}")
             func = self.generator.tokenizer.decode(ids, skip_special_tokens=True).strip()
+            logging.info(f"Prediction {idx}, socre: {s}")
+            logging.info(f"\n{func}")
             if len(func) == 0:
                 continue
             final_generations.append((func, s))

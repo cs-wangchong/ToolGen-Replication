@@ -289,7 +289,7 @@ class Generator:
 
         return bleu4, codebleu, lsp_hit
 
-    def generate(self, descs, beam_size=2, num_return_sequences=2, max_len=512, repetition_penalty=1.0):
+    def generate(self, descs, beam_size=2, max_len=512, repetition_penalty=1.0):
         source_ids = self.tokenizer(descs, add_special_tokens=True, padding=True, truncation=True, return_tensors="pt").input_ids
         source_ids = source_ids.to(self.device)
         attention_mask = source_ids.ne(self.tokenizer.pad_token_id)
@@ -304,8 +304,6 @@ class Generator:
             # early_stopping=True
         )
         outputs = [self.tokenizer.decode(cand, skip_special_tokens=True) for cand in outputs]
-        if num_return_sequences > 1:
-            outputs = [outputs[b:e] for b, e in zip(range(0, len(outputs), num_return_sequences), range(num_return_sequences, len(outputs)+num_return_sequences, num_return_sequences))]
         return outputs
 
     def save_model_info(self, path, checkpoint):
