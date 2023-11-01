@@ -1,20 +1,27 @@
 import json
 import logging
 import random
-import math
 from pathlib import Path
 import re
 import os
+import subprocess
+from typing import Union, Callable
+import string
+
+import ast
+import jedi
 
 from tqdm import tqdm
 import torch
-from torch.utils.data import DataLoader
-from torch.optim import AdamW
-from transformers import AddedToken
-from transformers import RobertaTokenizer, T5ForConditionalGeneration
-from transformers import get_linear_schedule_with_warmup
+from peft import PeftModelForCausalLM
+from transformers import LogitsProcessorList, RepetitionPenaltyLogitsProcessor
+from transformers import AutoTokenizer, PreTrainedTokenizer, AddedToken, RobertaTokenizer
+from transformers import AutoModelForCausalLM, LlamaForCausalLM, T5ForConditionalGeneration
+from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput, CausalLMOutputWithPast
 
+from coder.data_augmentor import DataAugmentor
 from coder.utils.metric_utils import Bleu, CodeBleu
+from coder.utils.trie import Trie
 from coder.constants import *
 
 torch.manual_seed(42)  # pytorch random seed
@@ -28,231 +35,331 @@ def clean_str(code):
     code = re.sub(r'"(.*?)"', "", code)
     return code.strip()
 
+
 class Generator:
-    def __init__(
-            self,
-            model_name="salesforce/codet5",
-            checkpoint=None,
-            additional_tokens=[PLM_LSP_POINT],
-            device="cuda"
-        ):
-        self.model_name = model_name
-        self.tokenizer: RobertaTokenizer = RobertaTokenizer.from_pretrained(model_name, use_fast=False)
-        self.model = T5ForConditionalGeneration.from_pretrained(model_name)
-        if additional_tokens is None:
-            additional_tokens = []
-        if len(additional_tokens) > 0:
-            self.tokenizer.add_tokens([AddedToken(t, rstrip=False, lstrip=False) for t in additional_tokens])
-            self.model.resize_token_embeddings(len(self.tokenizer))
-        if checkpoint:
-            self.model.load_state_dict(torch.load(checkpoint, map_location=device))
-        self.model.to(device)
-        self.additional_tokens = additional_tokens
-        self.device = device
-
-    def train(
-            self,
-            train_examples,
-            valid_examples,
-            epoch_num=2,
-            learning_rate=1e-4,
-            train_batch_size=8,
-            valid_batch_size=8,
-            adam_epsilon=1e-8,
-            weight_decay=0,
-            warmup_steps=0.1,
-            max_grad_norm=1.0,
-            train_sampling=None,
-            valid_sampling=None,
-            best_k=3,
-            patience=5,
-            max_len=512,
-            save_dir=None,
-            log_step=500,
-            valid_step=None,
-            report_prediction=False
-        ):
-        if save_dir is not None:
-            Path(save_dir).mkdir(parents=True, exist_ok=True)
-
-        if train_sampling is not None and train_sampling < len(train_examples):
-            train_examples = random.sample(train_examples, train_sampling)
-        if valid_sampling is not None and valid_sampling < len(valid_examples):
-            valid_examples = random.sample(valid_examples, valid_sampling)
-
-        num_train_batchs = math.ceil(len(train_examples) / train_batch_size)
-
-        num_train_optimization_steps = epoch_num * num_train_batchs
-        no_decay = ['bias', 'LayerNorm.weight']
-        optimizer_grouped_parameters = [
-            {'params': [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)],
-                'weight_decay': weight_decay},
-            {'params': [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-        ]
-        optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate, eps=adam_epsilon)
-
-        if warmup_steps < 1:
-            warmup_steps = num_train_optimization_steps * warmup_steps
-        else:
-            warmup_steps = int(warmup_steps)
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=num_train_optimization_steps)
-
-        # Start training
-        logging.info("***** Running training *****")
-        logging.info("  Model name = %s", self.model_name)
-        logging.info("  Training examples = %d", len(train_examples))
-        logging.info("  Validation examples = %d", len(valid_examples))
-        logging.info("  Training Batch size = %d", train_batch_size)
-        logging.info("  Training Batch num = %d", math.ceil(len(train_examples) / train_batch_size))
-        logging.info("  Validation Batch size = %d", valid_batch_size)
-        logging.info("  Validation Batch num = %d", math.ceil(len(valid_examples) / valid_batch_size))
-        
-        logging.info("")
-        logging.info("")
-        logging.info(f"  Epoch: {epoch_num}")
-        logging.info(f"  Learning rate: {learning_rate}")
-        logging.info(f"  Adam epsilon: {adam_epsilon}")
-        logging.info(f"  Weight decay: {weight_decay}")
-        logging.info(f"  Warmup steps: {warmup_steps}")
-        logging.info(f"  Max_grad_norm: {max_grad_norm}")
-        logging.info(f"  Training sampling: {train_sampling}")
-        logging.info(f"  Validation sampling: {valid_sampling}")
-        logging.info(f"  Save dir: {save_dir}")
-        logging.info(f"  Log step: {log_step}")
-        logging.info(f"  Validation step: {valid_step}")
-        logging.info(f"  Best k: {best_k}")
-        logging.info(f"  Patience: {patience}")
-        logging.info(f"  Max len: {max_len}")
-        logging.info(f"  Report prediction: {report_prediction}")
-        logging.info("")
-        logging.info("")
-
-        if not valid_step:
-            valid_step = num_train_batchs
-
-        total_steps = 0
-        topk_ckpts = [(None, None, 0)] * best_k
-        decresing_count = 0
-
-        dataloader = DataLoader(train_examples, batch_size=train_batch_size, shuffle=True)
-
-        for cur_epoch in range(epoch_num):
-            random.shuffle(train_examples)
-            train_steps, train_loss = 0, 0
-            # batch_ranges = list(zip(range(0, len(train_examples), train_batch_size), range(train_batch_size, len(train_examples)+train_batch_size, train_batch_size)))
-            # bar = tqdm(list(zip(range(0, size, batch_size), range(batch_size, size+batch_size, batch_size))), desc="Training", ascii=True)
-            for batch in dataloader:
-                self.model.train()
-                total_steps += 1
-                train_steps += 1
-                sources, targets = batch
-
-                source_ids = self.tokenizer(sources, add_special_tokens=True, padding=True, truncation=True, return_tensors="pt").input_ids
-                source_ids = source_ids.to(self.device)
-                target_ids = self.tokenizer(targets, add_special_tokens=True, padding=True, truncation=True, return_tensors="pt").input_ids
-                target_ids = target_ids.to(self.device)
-
-                # y_ids = target_ids[:, :-1].contiguous()
-                # labels = target_ids[:, 1:].clone().detach()
-                # labels[target_ids[:, 1:] == self.tokenizer.pad_token_id] = -100
-
-                attention_mask = source_ids.ne(self.tokenizer.pad_token_id)
-                decoder_attention_mask = target_ids.ne(self.tokenizer.pad_token_id)
-                outputs = self.model(
-                    input_ids=source_ids,
-                    attention_mask=attention_mask, 
-                    # decoder_input_ids=y_ids,
-                    # labels=labels,
-                    labels=target_ids,
-                    decoder_attention_mask=decoder_attention_mask,
-                    # output_hidden_states=True
-                )
-                loss = torch.mean(outputs.loss)
-                train_loss += loss.item()
-
-                loss.backward()
-                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
-                scheduler.step()
-
-                if total_steps % log_step == 0 or total_steps % num_train_batchs == 0:
-                    logging.info(f"[Training] Step {total_steps}, Epoch {cur_epoch+1}/{epoch_num}, Batch {train_steps}/{num_train_batchs},  Train loss {round(train_loss / train_steps, 6)}")
-
-                if total_steps % valid_step == 0 or total_steps == num_train_optimization_steps:
-                    record_file = f"{save_dir}/record-step{total_steps}.txt" if save_dir and report_prediction else None
-                    bleu, codebleu, lsp_hit = self.evaluate(valid_examples, valid_batch_size, max_len, beam_size=1, record_file=record_file)
-                    logging.info(f"[Validation] Step {total_steps}, bleu-4: {round(bleu, 4)}, codebleu: {round(codebleu, 4)}, lsp hit: {round(lsp_hit, 4)}") 
-            
-                    if save_dir is None:
-                        continue
-                    # timestamp = time.strftime("%m%d-%H%M", time.localtime())
-
-                    best_ckpt, _, best_bleu = topk_ckpts[0]
-                    if codebleu > best_bleu:
-                        decresing_count = 0
-                    else:
-                        decresing_count += 1
-                        logging.info(f"NOTE: CodeBleu does not increase for {decresing_count} validations")
-
-                    last_ckpt, last_record, last_bleu = topk_ckpts[-1]
-                    if codebleu > last_bleu:
-                        if last_ckpt:
-                            os.unlink(last_ckpt)
-                        if last_record:
-                            os.unlink(last_record)
-                        model_checkpoint = f"{save_dir}/model-step{total_steps}.ckpt"
-                        topk_ckpts = topk_ckpts[:-1] + [(model_checkpoint, record_file, codebleu)]
-                        topk_ckpts.sort(key=lambda t:t[-1], reverse=True)
-                        model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
-                        torch.save(model_to_save.state_dict(), model_checkpoint)
-                        # torch.save(model_to_save.state_dict(), f"{save_dir}/model-latest.bin")
-                        logging.info("Save the latest model into %s", model_checkpoint)
-                    elif record_file:
-                        os.unlink(record_file)
-
-                    logging.info(f"Top-{best_k} checkpoints: {topk_ckpts}")
-                    best_ckpt, _, best_bleu = topk_ckpts[0]
-                    self.save_model_info(f"{save_dir}/model.json", best_ckpt)
-
-                    if decresing_count > patience:
-                        break
-            else:
-                continue
-            logging.info(f"Early stop at {total_steps} steps")
-            break
-
-    def evaluate(self, eval_set, batch_size=8, max_len=512, beam_size=2, repetition_penalty=1.0, record_file=None):
+    def __init__(self, model:Union[PeftModelForCausalLM,T5ForConditionalGeneration], tokenizer:PreTrainedTokenizer, build_prompt:Callable):
+        self.model: Union[PeftModelForCausalLM, T5ForConditionalGeneration] = model
+        self.tokenizer: PreTrainedTokenizer = tokenizer
+        self.build_prompt = build_prompt
+        self.jedi_pj = None
         self.model.eval()
-        queries, predictions, expectations = [], [], []
-        batch_ranges = list(zip(range(0, len(eval_set), batch_size), range(batch_size, len(eval_set)+batch_size, batch_size)))
-        with torch.no_grad():
+        self.device = model.device
+    
+    def generate_simple(
+            self,
+            docstrs,
+            signatures,
+            max_len=512,
+            repetition_penalty=1.0
+        ):
+        prompts = [self.build_prompt(docstr, signature) for docstr, signature in zip(docstrs, signatures)]
+        input_ids = self.tokenizer(prompts, add_special_tokens=True, padding=True, truncation=True, return_tensors="pt").input_ids
+        if isinstance(self.model, PeftModelForCausalLM):
+            input_ids = input_ids[:,:-1]   # important: remove </s>
+        print(self.tokenizer.batch_decode(input_ids, skip_special_tokens=False))
+        input_ids = input_ids.to(self.device)
+        attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
+        print(attention_mask)
+        outputs = self.model.generate(
+            inputs=input_ids,
+            attention_mask=attention_mask,
+            max_length=max_len,
+            repetition_penalty=repetition_penalty,
+        )
+        print(self.tokenizer.batch_decode(outputs, skip_special_tokens=False))
+        outputs = [self.tokenizer.decode(cand, skip_special_tokens=True) for cand in outputs]
+        if isinstance(self.model, PeftModelForCausalLM):
+            outputs = [output[len(prompt):].strip() for output, prompt in zip(outputs, prompts)]
+
+        return outputs
+
+    def generate_with_lsp(
+            self,
+            docstr,
+            signature,
+            file_path,
+            code_context,
+            line,
+            column,
+            max_len=256,
+            lsp_threshold=0.8,
+            token_threshold=0.2,
+            token_k=5,
+            temperature=0.6,
+            repetition_penalty=1.0,
+        ):
+        prompt = self.build_prompt(docstr, signature)
+        input_ids = self.tokenizer([prompt], add_special_tokens=True, padding=True, truncation=True, return_tensors="pt").input_ids
+        input_ids = input_ids.to(self.device)
+        attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
+
+        logits_processor = LogitsProcessorList()
+        if repetition_penalty > 1:
+            logits_processor.append(RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty))
+
+        encoder_outputs, decoding_ids, past_key_values, prob, score = self._init_decoding(input_ids, attention_mask)
+
+        for _ in range(1, max_len + 1):
+            # logging.info(self.tokenizer.decode(decoding_ids[0], skip_special_tokens=False).strip())
+            if sum(decoding_ids[0].eq(self.tokenizer.eos_token_id).long()) >= 1: # type: ignore
+                break
+            lsp_called = False
+            func = self.tokenizer.decode(decoding_ids[0], skip_special_tokens=True)
+            # logging.info(func)
+            if func.strip().endswith(PLM_LSP_POINT) and prob >= lsp_threshold:
+                cleaned_func = clean_lsp(func)
+                cands = self.get_lsp_completions(cleaned_func, file_path, code_context, line, column)
+                logging.info(f"[ENTER LSP] confidence: {prob} >= {lsp_threshold}")
+                logging.info(f"\tuncomplete func: ```{repr(func)}```")
+                logging.info(f"\tcurrent score: {score}")
+                logging.info(f"\tlsp candidates: {cands}")
+
+                if len(cands) > 0:
+                    decoding_ids, past_key_values, prob, _score = self._lsp_step(
+                        cands,  
+                        decoding_ids,
+                        attention_mask,
+                        encoder_outputs,
+                        past_key_values,
+                        logits_processor,
+                        token_threshold=token_threshold,
+                        token_k=token_k,
+                        temperature=temperature
+                    )
+                    if decoding_ids is not None:
+                        score += _score
+                        lsp_called = True
+            if not lsp_called:
+                outputs = self._model_forward(decoding_ids, attention_mask, past_key_values, encoder_outputs)
+                logits = outputs.logits[:,-1,:]
+                probs = torch.softmax(logits, -1).view(-1)
+                # logging.info(probs[self._token2id(PLM_LSP_POINT)].item())
+                if func.strip().endswith(PLM_LSP_POINT):
+                    probs[self._token2id(PLM_LSP_POINT)] = 0.
+                best_idx = torch.argmax(probs, dim=-1, keepdim=False)
+                decoding_ids = torch.cat([decoding_ids, best_idx.unsqueeze(0).unsqueeze(0)], -1)
+                past_key_values = outputs.past_key_values
+                best_prob = probs[best_idx]
+                best_score = torch.log(best_prob)
+                prob = best_prob.item()
+                score += best_score.item()
+
+        func = self.tokenizer.decode(decoding_ids[0], skip_special_tokens=True).strip()
+        logging.info(f"[PREDICTION] score: {score}")
+        logging.info(f"\n{func}")
+        logging.info("")
+        return func
+    
+    def _id2token(self, id):
+        return self.tokenizer.convert_ids_to_tokens([id])[0]
+
+    def _token2id(self, token):
+        return self.tokenizer.convert_tokens_to_ids([token])[0]
+
+    def _init_decoding(self, input_ids, attention_mask):
+        # logging.info(input_ids)
+        if isinstance(self.model, PeftModelForCausalLM):
+            decoding_ids = torch.tensor([[self.tokenizer.bos_token_id]], dtype=torch.long, device=self.device)
+            outputs: CausalLMOutputWithPast = self.model(
+                input_ids = input_ids[:,:-1],           # important: remove </s>
+                attention_mask = attention_mask[:,:-1], # important: remove </s>
+                return_dict = True
+            )
+            encoder_outputs = None
+        elif isinstance(self.model, T5ForConditionalGeneration):
+            decoding_ids = torch.tensor([[self.model.generation_config.decoder_start_token_id]], dtype=torch.long, device=self.device)
+            outputs: Seq2SeqLMOutput = self.model(
+                input_ids = input_ids,
+                attention_mask = attention_mask,
+                decoder_input_ids = decoding_ids,
+                output_hidden_states = True,
+                return_dict = True
+            )
+            encoder_outputs = BaseModelOutput(
+                last_hidden_state=outputs.encoder_last_hidden_state,
+                hidden_states=None,
+                attentions=None,
+            )
+        logits = outputs.logits[:,-1,:]
+        probs = torch.softmax(logits, -1).view(-1)
+        best_idx = torch.argmax(probs, dim=-1, keepdim=False)
+        decoding_ids = torch.cat([decoding_ids, best_idx.unsqueeze(0).unsqueeze(0)], -1)
+        past_key_values = outputs.past_key_values
+        best_prob = probs[best_idx]
+        best_score = torch.log(best_prob)
+        return encoder_outputs, decoding_ids, past_key_values, best_prob.item(), best_score.item()
+    
+    def _model_forward(self, decoding_ids, attention_mask, past_key_values, encoder_outputs=None) -> Union[CausalLMOutputWithPast,Seq2SeqLMOutput]:
+        # logging.info(decoding_ids)
+        if isinstance(self.model, PeftModelForCausalLM):
+            outputs: CausalLMOutputWithPast = self.model(
+                input_ids = decoding_ids[:,-1:],
+                past_key_values = past_key_values,
+                return_dict = True
+            )
+        elif isinstance(self.model, T5ForConditionalGeneration):
+            encoder_outputs = BaseModelOutput(
+                last_hidden_state=encoder_outputs.last_hidden_state.repeat(decoding_ids.size(0), 1, 1),
+                hidden_states=None,
+                attentions=None,
+            )
+            outputs: Seq2SeqLMOutput = self.model(
+                encoder_outputs = encoder_outputs,
+                attention_mask = attention_mask,
+                decoder_input_ids = decoding_ids[:,-1:],
+                past_key_values = past_key_values,
+                return_dict = True
+            )
+        return outputs
+
+    def _lsp_step(
+            self,
+            all_cands,
+            decoding_ids,
+            attention_mask,
+            encoder_outputs,
+            past_key_values,
+            logits_processor,
+            token_threshold=0.2,
+            token_k=5,
+            temperature=0.6
+        ):
+
+        if token_k:
+            token_k = min(token_k, len(self.tokenizer))
+
+        trie = Trie()
+        for cand in all_cands:
+            trie.insert([self._token2id(t) for t in self.tokenizer.tokenize(cand)])
+        pending_node = trie.root
+
+        best_prob, best_score = 0, 0
+
+        step = 0
+        while True:
+            if pending_node.is_end_of_sequence and pending_node.is_valid:
+                return decoding_ids, past_key_values, best_prob, best_score
+            children = pending_node.get_children()
+
+            outputs = self._model_forward(decoding_ids, attention_mask, past_key_values, encoder_outputs)
+            logits = outputs.logits[:,-1,:].view(-1)
+            
+            tau = torch.ones_like(logits, device=self.device)
+            tau[[node.key for node in children]] = 1 / temperature
+            logits *= tau
+            
+            probs = torch.softmax(logits, -1)
+            log_probs = torch.log(probs)
+            
+            children.sort(key=lambda child: probs[child.key].item(), reverse=True)
+            for child in children[:5]:
+                logging.info('\t' * step + f"token: {self._id2token(child.key)}, prob: {probs[child.key].item()}")
+            if token_k:
+                topk_probs, topk_idxs = probs.topk(token_k, -1, True, True)
+                topk_idxs = {_idx.item() for _idx in topk_idxs}
+                topk_tokens_with_probs = [(self._id2token(_idx.item()), round(_prob.item(), 4)) for _prob, _idx in zip(topk_probs, topk_idxs)]
+                topk_tokens_with_probs.sort(key=lambda x: x[-1], reverse=True)
+            
+            pending_node = children[0]
+            if probs[pending_node.key].item() < token_threshold or (token_k and pending_node.key not in topk_idxs):
+                logging.info("\t\tNo valid candidates")
+                return None, None, None, None
+            decoding_ids = torch.cat([decoding_ids, torch.tensor([[pending_node.key]], dtype=torch.long, device=self.device)], -1)
+            past_key_values = outputs.past_key_values
+            best_prob = probs[pending_node.key].item()
+            best_score += log_probs[pending_node.key].item()
+            step += 1
+    
+    def update_lsp_project(self, pj_path, py_env=None):
+        if self.jedi_pj is None or self.jedi_pj._path != pj_path:
+            self.jedi_pj: jedi.Project = jedi.Project(pj_path, environment_path=py_env, added_sys_path=(pj_path,))
+
+    def get_lsp_context(self, file_path: str, func_code:str):
+        with Path(file_path).open("r") as f:
+            code = f.read()
+        try:
+            tree = ast.parse(code)
+        except Exception as e:
+            return None, None, None
+        funcs = (func for func in ast.walk(tree) if isinstance(func, ast.FunctionDef))
+        
+        for func in funcs:
+            func_source = ast.get_source_segment(code, func)
+            line, column = func.lineno, func.col_offset
+            rest_source = code.replace(func_source, "<PLACEHOLDER>")
+            _, tokens = DataAugmentor.tokenize_func(func_source)
+            original_func = "".join(tokens).replace(PLM_LSP_POINT, "<unk>").strip()
+            if original_func == func_code.replace(PLM_LSP_POINT, "").strip():
+                return rest_source, line, column
+        return None, None, None
+    
+    def get_lsp_completions(self, func, file_path, code_context, line, column):
+        lines = func.split("\n")
+        _line, _column = line, column
+        if len(lines) == 1:
+            _column += len(lines[0])
+        else:
+            _line += len(lines) - 1
+            _column = len(lines[-1])
+        context = code_context.replace("<PLACEHOLDER>", func)
+        # logging.info(f"context: ```\n{context}\n```")
+        try:
+            script = jedi.Script(project=self.jedi_pj, path=file_path, code=context)
+            completions = script.complete(line=_line, column=_column)
+        except Exception as e:
+            completions = []
+        completions = [completion.complete.strip() for completion in completions]
+        completions = [
+            completion for completion in completions if len(completion) > 0 and completion not in SKIPPED
+        ]
+        return completions
+    
+
+    def evaluate(
+            self,
+            eval_set,
+            batch_size=32,
+            max_len=256,
+            lsp_threshold=0.8,
+            token_threshold=0.2,
+            token_k=5,
+            temperature=0.6,
+            repetition_penalty=1.0,
+            record_file=None,
+            call_lsp=False
+        ):
+        predictions = []
+        if not call_lsp:
+            batch_ranges = list(zip(range(0, len(eval_set), batch_size), range(batch_size, len(eval_set)+batch_size, batch_size)))
             for beg, end in tqdm(batch_ranges, ascii=True, desc="Evaluation"):
                 batch = eval_set[beg:end]
-                # descs, codes = zip(*batch)
-                # descs, signatures, bodies = zip(*batch)
-                # sources = self.pack_desc(descs)
-                # targets = self.pack_code(signatures, bodies)
-
-                sources, targets = zip(*batch)
-                sources = [f"{source}" for source in sources]
-                targets = [f"{target}" for target in targets]
-                descs = sources
-
-                outputs = self.generate(sources, beam_size=beam_size, max_len=max_len, repetition_penalty=repetition_penalty)
-                queries.extend(descs)
+                _, _, docstrs, signatures, _ = zip(*batch)
+                outputs = self.generate_simple(docstrs, signatures, max_len=max_len + 48, repetition_penalty=repetition_penalty)
                 predictions.extend(outputs)
-                expectations.extend(targets)
+        else:
+            for repo, file_path, docstr, signature, code in tqdm(eval_set, ascii=True, desc="Evaluation"):
+                self.update_lsp_project(repo)
+                context, line, column = self.get_lsp_context(file_path, code)
+                if context is None:
+                    logging.error("failed to get lsp context.\n{code}")
+                    output = self.generate_simple([docstr], [signature], max_len=max_len + 48, repetition_penalty=repetition_penalty)[0]
+                else:
+                    logging.info(f"====================================")
+                    logging.info(f"[EXPECTATION]\n{code.strip()}")
+                    output = self.generate_with_lsp(docstr, signature, file_path, context, line, column, max_len, lsp_threshold, token_threshold, token_k, temperature, repetition_penalty)
+                predictions.append(output)
         
-        total_count = 0
-        hit_count = 0
+        if record_file is not None:
+            record_f = Path(record_file).open("w")
+
+        total_lsp_count, hit_lsp_count = 0, 0
+        noerror_count = 0
         infos = []
-        for query, pred, expt in zip(queries, predictions, expectations):
-            info = f"======================\n[PROMPT]:\n{query}\n[EXPECTATION]:\n{expt}\n[PREDICTION]:\n{pred}\n"
-            signature = query.split("Function Signature:")[-1].strip()
+        for (repo, file_path, docstr, signature, expt), pred in tqdm(zip(eval_set, predictions), desc="Calculating", total=len(eval_set), ascii=True):
+            info = f"======================\n[PROMPT]:\n{docstr}\n[Signature]:\n{signature}\n[EXPECTATION]:\n{expt}\n[PREDICTION]:\n{pred}\n"
             key_eles = set()
-            for mobj in re.finditer(r"(%s)(\w+)(\W|$)" % re.escape(PLM_LSP_POINT), expt):
-                key_ele = mobj.group(2).strip()
+            for mobj in re.finditer(r"%s(\w+)(\W|$)" % re.escape(PLM_LSP_POINT), expt):
+                key_ele = mobj.group(1).strip()
                 if len(key_ele) == 0:
                     continue
                 if re.search(r"\s+%s\s*=" % re.escape(key_ele), expt):
@@ -265,61 +372,61 @@ class Generator:
                     continue
                 key_eles.add(key_ele)
             for key_ele in key_eles:
-                total_count += 1
+                total_lsp_count += 1
                 if re.search(r"(\W|^)%s(\W|$)" % re.escape(key_ele), clean_str(pred)):
-                    hit_count += 1
+                    hit_lsp_count += 1
                     info = f"{info}(√) {key_ele}\n"
                 else:
                     info = f"{info}(x) {key_ele}\n"
             infos.append(info)
-        logging.info(f"total lsp count: {total_count}, hit lsp count: {hit_count}")
-        lsp_hit = hit_count/total_count if total_count > 0 else 0
+            
+            context, start_line, _ = self.get_lsp_context(file_path, expt)
+            end_line = start_line + len(pred.split("\n"))
+            context = context.replace("<PLACEHOLDER>", clean_lsp(pred))
+            tmp_py = f"{file_path[:-3]}_{''.join(random.choice(string.ascii_letters + string.digits) for _ in range(10))}.py"
+            tmp_json = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(10)) + ".json"
+            with Path(tmp_py).open("w") as f:
+                f.write(context)
+            command = ["pylint", "--disable=C,R,W", f"--output-format=json:{tmp_json}", tmp_py]
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+            errors = []
+            if len(stderr.decode().strip()) > 0:
+                logging.error(f"error when pylint\n{stderr.decode()}")
+            else:
+                with Path(tmp_json).open("r") as f:
+                    error_content = f.read().strip()
+                if len(error_content) > 0:
+                    errors = json.loads(error_content)
+            for err_item in errors:
+                if err_item["line"] >= start_line and err_item["line"] <= end_line:
+                    infos.append(f"[error] {err_item['message']}")
+                    break
+            else:
+                noerror_count += 1
+
+            os.unlink(tmp_py)
+            os.unlink(tmp_json)
+
+            if record_file is not None and len(infos) % 100 == 0:
+                record_f.write("\n".join(infos))
+                infos = []
+
+        if record_file is not None and len(infos) > 0:
+            record_f.write("\n".join(infos))
+        record_f.close()
+
+        logging.info(f"total lsp count: {total_lsp_count}, hit lsp count: {hit_lsp_count}")
+        logging.info(f"total func count: {len(eval_set)}, no-error func count: {noerror_count}")
+        lsp_hit = hit_lsp_count / total_lsp_count if total_lsp_count > 0 else 0
+        noerror_rate = noerror_count / len(eval_set)
 
         predictions = [clean_lsp(code) for code in predictions]
-        expectations = [clean_lsp(code) for code in expectations]
-        codebleu = CodeBleu.compute_codebleu(expectations, predictions)        
-        
+        expectations = [clean_lsp(expt) for repo, file_path, docstr, signature, expt in eval_set]
+        codebleu = CodeBleu.compute_codebleu(expectations, predictions)
+
         predictions = [self.tokenizer.tokenize(code) for code in predictions]
         expectations = [self.tokenizer.tokenize(code) for code in expectations]
-        bleu4 = Bleu.compute_bleu(expectations, predictions, smooth=True)
+        bleu = Bleu.compute_bleu(expectations, predictions, smooth=True)
 
-        if record_file is not None:
-            with Path(record_file).open("w") as f:
-                f.write("\n".join(infos))
-
-        return bleu4, codebleu, lsp_hit
-
-    def generate(self, descs, beam_size=2, max_len=512, repetition_penalty=1.0):
-        source_ids = self.tokenizer(descs, add_special_tokens=True, padding=True, truncation=True, return_tensors="pt").input_ids
-        source_ids = source_ids.to(self.device)
-        attention_mask = source_ids.ne(self.tokenizer.pad_token_id)
-        outputs = self.model.generate(
-            source_ids,
-            attention_mask=attention_mask,
-            max_length=max_len,
-            repetition_penalty=repetition_penalty,
-            num_beams=beam_size,
-            num_return_sequences=1,
-            # length_penalty=1.0, 
-            # early_stopping=True
-        )
-        outputs = [self.tokenizer.decode(cand, skip_special_tokens=True) for cand in outputs]
-        return outputs
-
-    def save_model_info(self, path, checkpoint):
-        json_data = {
-            "model_name": self.model_name,
-            "additional_tokens": self.additional_tokens,
-            "model_checkpoint": checkpoint,
-        }
-        with Path(path).open('w') as f:
-            json.dump(json_data, f, indent=4)
-
-    @classmethod
-    def load_from_model_info(cls, path, device="cuda"):
-        with Path(path).open('r') as f:
-            json_data = json.load(f)
-        model = cls(json_data['model_name'], json_data['model_checkpoint'], json_data['additional_tokens'], device)
-        return model
-
-    
+        return bleu, codebleu, lsp_hit, noerror_rate
