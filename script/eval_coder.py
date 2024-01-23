@@ -30,7 +30,7 @@ if __name__ == '__main__':
     parser.add_argument("-sample", "--sample", required=False, default=False, action="store_true")
     parser.add_argument("-gpu", "--gpu", required=False, default=False, action="store_true")
     
-    parser.add_argument("-lspconf", "--lsp_confidence", required=False, type=float, default=0.8)
+    parser.add_argument("-lspconf", "--lsp_confidence", required=False, type=float, default=0.5)
     parser.add_argument("-tkconf", "--token_confidence", required=False, type=float, default=0.0)
     parser.add_argument("-tknum", "--token_number", required=False, type=float, default=None)
     parser.add_argument("-temp", "--temperature", required=False, type=float, default=1.0)
