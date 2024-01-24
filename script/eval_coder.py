@@ -26,9 +26,9 @@ if __name__ == '__main__':
     parser.add_argument("-model", "--model", required=True, type=str)
     parser.add_argument("-version", "--version", required=False, type=str, default=None)
     parser.add_argument("-stamp", "--timestamp", required=False, type=str, default=None)
-    parser.add_argument("-lsp", "--lsp", required=False, default=False, action="store_true")
+    parser.add_argument("-lsp", "--lsp", required=False, default=True, action="store_true")
     parser.add_argument("-sample", "--sample", required=False, default=False, action="store_true")
-    parser.add_argument("-gpu", "--gpu", required=False, default=False, action="store_true")
+    parser.add_argument("-gpu", "--gpu", required=False, default=True, action="store_true")
     
     parser.add_argument("-lspconf", "--lsp_confidence", required=False, type=float, default=0.5)
     parser.add_argument("-tkconf", "--token_confidence", required=False, type=float, default=0.0)
