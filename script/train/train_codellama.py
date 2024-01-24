@@ -17,8 +17,8 @@ from coder.constants import PLM_LSP_POINT
 if __name__ == '__main__':
     MODEL = "codellama/CodeLlama-7b-Python-hf"
 
-    LSP_MODE = "nolsp"
-    # LSP_MODE = "lsp"
+    # LSP_MODE = "nolsp"
+    LSP_MODE = "lsp"
 
     TIMESTAMP = time.strftime("%y%m%d-%H%M%S", time.localtime())
     DIR = f"models-{LSP_MODE}/{MODEL.split('/')[-1]}-{str(TIMESTAMP)}"
