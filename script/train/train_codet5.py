@@ -16,7 +16,7 @@ from coder.constants import PLM_LSP_POINT
 if __name__ == '__main__':
     MODEL = "Salesforce/codet5p-220m-py"
 
-    LSP_MODE = "nolsp"
+    # LSP_MODE = "nolsp"
     LSP_MODE = "lsp"
 
 
