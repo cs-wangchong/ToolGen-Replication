@@ -15,11 +15,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 MODEL_FACTORY = {
-    "codegen": ("Salesforce/codegen-350M-mono", init_codegen),
-    "deepseek": ("deepseek-ai/deepseek-coder-1.3b-base", init_deepseek),
-    "codellama": ("codellama/CodeLlama-7b-Python-hf", init_codellama),
-    "deepseek-lora": ("deepseek-ai/deepseek-coder-1.3b-base", init_deepseek_lora),
-    "codellama-lora": ("codellama/CodeLlama-7b-Python-hf", init_codellama_lora),
+    "codellama": ("codellama/CodeLlama-7b-Python-hf", init_codellama_lora),
     "codet5": ("Salesforce/codet5p-220m-py", init_codet5),
     "codegpt": ("microsoft/CodeGPT-small-py", init_codegpt),
 }
