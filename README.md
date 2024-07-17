@@ -1,7 +1,7 @@
 # ToolGen-Replication
 
 ## Datasets
-Download the augmented dataset and benchmark dataset from [ToolGen-Data](https://drive.google.com/drive/folders/16ddTvkknl9eDnX1J6tDJLxc-04hEetDK?usp=drive_link) and put them into a folder named `data/datasets`.
+Download the augmented dataset and benchmark dataset from [ToolGen-Datasets](https://drive.google.com/drive/folders/1AAB94jLarnO8INJMOY4aBPhYjOzQQLhr?usp=sharing) and put them into a folder named `data/datasets`.
 
 
 ## Fine-tuning
@@ -21,7 +21,7 @@ An execution example:
 CUDA_VISIBLE_DEVICES=0 python script/train_model.py --model=codet5 --lr=5e-6 --epoch=10 --max_len=256 --train_batch=64 --valid_batch=64 --lsp
 ```
 
-We have released some fine-tuned checkpoints at [ToolGen-Checkpoints](fds). In the folder, there are the following checkpoints:
+We have released some fine-tuned checkpoints at [ToolGen-Checkpoints](https://drive.google.com/drive/folders/1VRxceCkrazjyY4bgiVC3Esm-A-DhgWDU?usp=sharing). In the folder, there are the following checkpoints:
 - CodeGPTs:
     - `CodeGPT-small-py/nolsp-xxxx`: CodeGPT model fine-tuned on **original** functions
     - `CodeGPT-small-py/lsp-xxxx`: CodeGPT model fine-tuned on **augmented** functions
@@ -48,4 +48,4 @@ An example:
 CUDA_VISIBLE_DEVICES=0 python script/eval_coder.py --dir=models/codet5p-220m-py/lsp-240701-111433 --batch=64
 ```
 
-Note that, to calculate dependency-based metrics, code repositories are needed. 
+Note that, to calculate dependency-based metrics, code repositories should be downloaded from [ToolGen-TestRepos](https://drive.google.com/file/d/1O1sEn48m3P3qyqFpVH9DYKg7saO8Roqa/view?usp=sharing). 
