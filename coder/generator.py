@@ -1,34 +1,39 @@
-import json
 import logging
-import random
-from pathlib import Path
 import re
-import os
-import subprocess
-from typing import Union, Callable
-import string
+from typing import Callable, List, Union
+import warnings
+import copy
+import inspect
 
-import ast
 import jedi
-
-from tqdm import tqdm
 import torch
-from peft import PeftModelForCausalLM
-from transformers import LogitsProcessorList, RepetitionPenaltyLogitsProcessor
-from transformers import AutoTokenizer, PreTrainedTokenizer, AddedToken, RobertaTokenizer
-from transformers import AutoModelForCausalLM, LlamaForCausalLM, T5ForConditionalGeneration
-from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput, CausalLMOutputWithPast
 
-from coder.data_augmentor import DataAugmentor
-from coder.utils.metric_utils import Bleu, CodeBleu
+from peft import PeftModelForCausalLM
+from transformers import AutoTokenizer, PreTrainedTokenizer, AddedToken, RobertaTokenizer
+from transformers import PreTrainedModel, AutoModelForCausalLM
+from transformers import LlamaForCausalLM, T5ForConditionalGeneration, GPT2LMHeadModel
+from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput, CausalLMOutputWithPast
+from transformers.generation.configuration_utils import GenerationConfig
+from transformers.utils import is_torchdynamo_compiling
+
 from coder.utils.trie import Trie
 from coder.constants import *
+from coder.prompt import *
 
 torch.manual_seed(42)  # pytorch random seed
 
-def clean_lsp(code:str):
-    code = re.sub(r" ?%s ?" % re.escape(PLM_LSP_POINT), "", code)
+def clean_pad(code:str):
+    code = re.sub(r" ?%s ?" % re.escape("<pad>"), "", code)
     return code
+
+def clean_lsp(code:str, strip=True):
+    if strip:
+        regexp = r" %s ?" % re.escape(PLM_LSP_POINT)
+    else:
+        regexp = r"%s" % re.escape(PLM_LSP_POINT)
+    code = re.sub(regexp, "", code)
+    return code
+
 
 def clean_str(code):
     code = re.sub(r"'(.*?)'", "", code)
@@ -37,261 +42,310 @@ def clean_str(code):
 
 
 class Generator:
-    def __init__(self, model:Union[PeftModelForCausalLM,T5ForConditionalGeneration], tokenizer:PreTrainedTokenizer, build_prompt:Callable):
-        self.model: Union[PeftModelForCausalLM, T5ForConditionalGeneration] = model
+    def __init__(self, model:PreTrainedModel, tokenizer:PreTrainedTokenizer, model_max_length=1024):
+        self.model: PreTrainedModel = model
         self.tokenizer: PreTrainedTokenizer = tokenizer
-        self.build_prompt = build_prompt
         self.jedi_pj = None
         self.model.eval()
+        self.model_max_length = min(model_max_length, self.tokenizer.model_max_length)
         self.device = model.device
+        self.all_special_ids = set(self.tokenizer.all_special_ids)
+        self.lsp_id = self.tokenizer.convert_tokens_to_ids(PLM_LSP_POINT)
     
     def generate_simple(
             self,
-            docstrs,
-            signatures,
+            inputs: List[dict],
             max_len=512,
-            repetition_penalty=1.0
+            repetition_penalty=1.0 
         ):
-        prompts = [self.build_prompt(docstr, signature) for docstr, signature in zip(docstrs, signatures)]
+        if self.model.config.is_encoder_decoder:
+            prompts = [build_prompt_encoder_decoder(inp["docstr"], inp["signature"]) for inp in inputs]
+        else:
+            prompts = [build_prompt_decoder_only(inp["prefix"]) for inp in inputs]
         input_ids = self.tokenizer(prompts, add_special_tokens=True, padding=True, truncation=True, return_tensors="pt").input_ids
-        if isinstance(self.model, PeftModelForCausalLM):
-            input_ids = input_ids[:,:-1]   # important: remove </s>
-        print(self.tokenizer.batch_decode(input_ids, skip_special_tokens=False))
+        if input_ids.shape[1] >= self.model_max_length:
+            return [f"def {inst['signature']}:pass" for inst in inputs]
         input_ids = input_ids.to(self.device)
         attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
-        print(attention_mask)
         outputs = self.model.generate(
             inputs=input_ids,
             attention_mask=attention_mask,
-            max_length=max_len,
+            max_length=min(self.model_max_length, input_ids.shape[1] + max_len),
             repetition_penalty=repetition_penalty,
+            pad_token_id=self.tokenizer.eos_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
         )
-        print(self.tokenizer.batch_decode(outputs, skip_special_tokens=False))
         outputs = [self.tokenizer.decode(cand, skip_special_tokens=True) for cand in outputs]
-        if isinstance(self.model, PeftModelForCausalLM):
-            outputs = [output[len(prompt):].strip() for output, prompt in zip(outputs, prompts)]
-
+        # if not self.model.config.is_encoder_decoder:
+        #     outputs = [output[len(prompt):].strip() for output, prompt in zip(outputs, prompts)]
+        outputs = [clean_pad(output) for output in outputs]
         return outputs
+        
 
+    @torch.no_grad()
     def generate_with_lsp(
             self,
-            docstr,
-            signature,
-            file_path,
-            code_context,
-            line,
-            column,
+            inputs,
+            # file_paths,
+            # code_contexts,
+            # lines,
+            # columns,
             max_len=256,
-            lsp_threshold=0.8,
-            token_threshold=0.2,
-            token_k=5,
-            temperature=0.6,
+            lsp_conf=0.8,
+            beam_size=1,
             repetition_penalty=1.0,
+            rm_lsp=True,
+            verbose=True,
         ):
-        prompt = self.build_prompt(docstr, signature)
-        input_ids = self.tokenizer([prompt], add_special_tokens=True, padding=True, truncation=True, return_tensors="pt").input_ids
+        if self.model.config.is_encoder_decoder:
+            prompts = [build_prompt_encoder_decoder(inp["docstr"], inp["signature"]) for inp in inputs]
+        else:
+            prompts = [build_prompt_decoder_only(inp["prefix"]) for inp in inputs]
+        file_paths = [inp["path"] for inp in inputs]
+        code_contexts = [inp["context"] for inp in inputs]
+        lines = [inp["line"] for inp in inputs]
+        columns = [inp["column"] for inp in inputs]
+        # prepare inputs
+        input_ids = self.tokenizer(prompts, add_special_tokens=True, padding=True, truncation=True, return_tensors="pt").input_ids
+        if input_ids.shape[1] >= self.model_max_length:
+            return [f"def {inst['signature']}:pass" for inst in inputs]
+        
         input_ids = input_ids.to(self.device)
         attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
+        
+        model_kwargs = {"attention_mask": attention_mask}
 
-        logits_processor = LogitsProcessorList()
-        if repetition_penalty > 1:
-            logits_processor.append(RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty))
+        input_ids, model_kwargs = self._prepare(input_ids, model_kwargs)
+        batch_size = input_ids.shape[0]
 
-        encoder_outputs, decoding_ids, past_key_values, prob, score = self._init_decoding(input_ids, attention_mask)
+        # output_ids = [[] for _ in range(batch_size)]
+        if self.model.config.is_encoder_decoder:
+            output_ids = [[] for _ in range(batch_size)]
+        else:
+            output_ids = [self.tokenizer.encode(prompt, add_special_tokens=False, padding=False, truncation=False) for prompt in prompts]
+        best_probs, best_scores = torch.zeros((batch_size,), device=self.device), torch.zeros((batch_size,), device=self.device)
 
-        for _ in range(1, max_len + 1):
-            # logging.info(self.tokenizer.decode(decoding_ids[0], skip_special_tokens=False).strip())
-            if sum(decoding_ids[0].eq(self.tokenizer.eos_token_id).long()) >= 1: # type: ignore
+        nodes = [None] * batch_size
+        accumulated_infos = [(0, 0)] * batch_size
+        funcs = []
+        for idx in range(batch_size):
+            func = self.tokenizer.decode(output_ids[idx], skip_special_tokens=False).strip()
+            if func.startswith(self.tokenizer.bos_token):
+                func = func[len(self.tokenizer.bos_token):].strip()
+            funcs.append(func)
+        lsps = [(None, None, None)] * batch_size
+        lsp_logs = [[] for _ in range(batch_size)]
+
+        cand_cache = dict()
+
+        finished = set()
+        for _ in range(max_len):
+
+            for idx in range(batch_size):
+                if idx in finished:
+                    continue
+
+                # row = input_ids[idx]
+                # print(row[-1].item() == self.lsp_id)
+                # if rm_lsp and row[-1].item() == self.lsp_id:
+                #     new_row = torch.zeros_like(row)
+                #     new_row[0] = self.tokenizer.pad_token_id
+                #     new_row[1:] = row[:-1]
+                #     input_ids[idx] = new_row
+                func = funcs[idx]
+                if func.endswith(PLM_LSP_POINT) and best_probs[idx].item() >= lsp_conf:
+                    cleaned_func = clean_lsp(func, strip=True)
+                    file_path, code_context, line, column = file_paths[idx], code_contexts[idx], lines[idx], columns[idx]
+                    cands = self.get_lsp_completions(cleaned_func, file_path, code_context, line, column)
+                    if len(cands) == 0:
+                        continue
+                    lsps[idx] = (func, best_probs[idx].item(), cands)
+                    trie = Trie()
+                    # speed up
+                    func_len = None
+                    for cand in cands:
+                        if cand not in cand_cache:
+                            if func_len is None:
+                                func_len = len(self.tokenizer.tokenize(func))
+                            # tokenization results may be different when using candidates solely or using candidates within func
+                            tokens = self.tokenizer.tokenize(func + cand)[func_len:]
+                            cand_cache[cand] = [self._token2id(t) for t in tokens]
+                        trie.insert(cand_cache[cand])
+                        
+                    nodes[idx] = trie.root
+            
+
+            model_inputs = self.model.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            outputs = self.model(**model_inputs)
+            model_kwargs = self.model._update_model_kwargs_for_generation(
+                outputs, model_kwargs, is_encoder_decoder=self.model.config.is_encoder_decoder
+            )
+            
+            logits = outputs.logits[:,-1,:]
+            probs = torch.softmax(logits, -1)
+
+            next_ids = []
+            for idx in range(batch_size):
+                if idx in finished:
+                    next_ids.append(self.tokenizer.pad_token_id)
+                    continue
+                _probs = probs[idx]
+                if funcs[idx].endswith(PLM_LSP_POINT):
+                    _probs[self._token2id(PLM_LSP_POINT)] = 0.
+                # no lsp tokens involved
+                if nodes[idx] is None or len(nodes[idx].get_children()) == 0:
+                    next_id = torch.argmax(_probs, dim=-1, keepdim=False).item()
+                    nodes[idx] = None
+                    accumulated_infos[idx] = (0, 0)
+                else:
+                    children = nodes[idx].get_children()
+                    children = [(child, _probs[child.key].item()) for child in children]
+                    children.sort(key=lambda p: p[1], reverse=True)
+                    best_child, score = children[0]
+                    acc_score, acc_len = accumulated_infos[idx]
+                    # the current node is not only an end_of_sequence but also an internal node, but treat it as an internal node
+                    if nodes[idx].is_end_of_sequence and acc_score / acc_len > (acc_score + score) / (acc_len + 1):
+                        next_id = torch.argmax(_probs, dim=-1, keepdim=False).item()
+                        nodes[idx] = None
+                        accumulated_infos[idx] = (0, 0)
+                        lsp_logs[idx].append((lsp_func, lsp_prob, lsp_cands, children))
+                        # if :
+                        #     next_id = best_child.key
+                        #     nodes[idx] = best_child
+                        #     lsp_func, lsp_prob, lsp_cands = lsps[idx]
+                        #     accumulated_infos[idx] = (acc_score + score, acc_len + 1)
+                        #     lsp_logs[idx].append((lsp_func, lsp_prob, lsp_cands, children))
+                        # else:  # treat the current node as the end of the sequence                                                        
+                            
+                    else: # the current node is absolutely an internal node
+                        next_id = best_child.key
+                        nodes[idx] = best_child
+                        lsp_func, lsp_prob, lsp_cands = lsps[idx]
+                        accumulated_infos[idx] = (acc_score + score, acc_len + 1)
+                        lsp_logs[idx].append((lsp_func, lsp_prob, lsp_cands, children))
+                    
+                next_ids.append(next_id)
+                best_probs[idx] = _probs[next_id]
+                best_scores[idx] += torch.log(_probs[next_id])
+                if next_id in {self.tokenizer.eos_token_id, self.tokenizer.pad_token_id}:
+                    finished.add(idx)
+               
+            input_ids = torch.cat([input_ids, torch.tensor([[_id] for _id in next_ids], dtype=torch.long, device=self.device)], -1)
+
+            for beam_ids, next_id in zip(output_ids, next_ids):
+                if next_id in self.all_special_ids:
+                    continue
+                beam_ids.append(next_id)
+            
+            for idx in range(batch_size):
+                func = self.tokenizer.decode(output_ids[idx], skip_special_tokens=False).strip()
+                if func.startswith(self.tokenizer.bos_token):
+                    func = func[len(self.tokenizer.bos_token):].strip()
+                funcs[idx] = func
+            
+            if len(finished) == batch_size or input_ids.shape[1] >= self.model_max_length:
                 break
-            lsp_called = False
-            func = self.tokenizer.decode(decoding_ids[0], skip_special_tokens=True)
-            # logging.info(func)
-            if func.strip().endswith(PLM_LSP_POINT) and prob >= lsp_threshold:
-                cleaned_func = clean_lsp(func)
-                cands = self.get_lsp_completions(cleaned_func, file_path, code_context, line, column)
-                logging.info(f"[ENTER LSP] confidence: {prob} >= {lsp_threshold}")
-                logging.info(f"\tuncomplete func: ```{repr(func)}```")
-                logging.info(f"\tcurrent score: {score}")
-                logging.info(f"\tlsp candidates: {cands}")
+        if verbose:
+            for idx in range(batch_size):
+                if len(lsp_logs[idx]) == 0:
+                    continue
+                logging.info(f"================================================")
+                last_func = None
+                level = 1
+                for (func, prob, cands, children) in lsp_logs[idx]:
+                    if func != last_func:
+                        logging.info(f"[ENTER LSP] {prob} >= {lsp_conf}")
+                        logging.info(f"\tuncomplete func: ```{repr(func)}```")
+                        logging.info(f"\tlsp candidates: {cands}")
+                        last_func = func
+                        level = 1
+                    for child, _prob in children[:5]:
+                        logging.info('\t' * level + f"\ttoken: {self._id2token(child.key)}, prob: {_prob}")
+                    level += 1
+        funcs = [clean_pad(func) for func in funcs]
+        return funcs
 
-                if len(cands) > 0:
-                    decoding_ids, past_key_values, prob, _score = self._lsp_step(
-                        cands,  
-                        decoding_ids,
-                        attention_mask,
-                        encoder_outputs,
-                        past_key_values,
-                        logits_processor,
-                        token_threshold=token_threshold,
-                        token_k=token_k,
-                        temperature=temperature
-                    )
-                    if decoding_ids is not None:
-                        score += _score
-                        lsp_called = True
-            if not lsp_called:
-                outputs = self._model_forward(decoding_ids, attention_mask, past_key_values, encoder_outputs)
-                logits = outputs.logits[:,-1,:]
-                probs = torch.softmax(logits, -1).view(-1)
-                # logging.info(probs[self._token2id(PLM_LSP_POINT)].item())
-                if func.strip().endswith(PLM_LSP_POINT):
-                    probs[self._token2id(PLM_LSP_POINT)] = 0.
-                best_idx = torch.argmax(probs, dim=-1, keepdim=False)
-                decoding_ids = torch.cat([decoding_ids, best_idx.unsqueeze(0).unsqueeze(0)], -1)
-                past_key_values = outputs.past_key_values
-                best_prob = probs[best_idx]
-                best_score = torch.log(best_prob)
-                prob = best_prob.item()
-                score += best_score.item()
 
-        func = self.tokenizer.decode(decoding_ids[0], skip_special_tokens=True).strip()
-        logging.info(f"[PREDICTION] score: {score}")
-        logging.info(f"\n{func}")
-        logging.info("")
-        return func
     
+    def _prepare(self, inputs, kwargs):
+        '''copied from transformers.generation.utils.GenerationMixin.generate()'''
+        # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
+        self.model._validate_model_class()
+        generation_config, model_kwargs = self.model._prepare_generation_config(None, **kwargs)
+        self.model._validate_model_kwargs(model_kwargs.copy())
+
+        # 2. Set generation parameters if not already defined
+
+        accepts_attention_mask = "attention_mask" in set(inspect.signature(self.model.forward).parameters.keys())
+        requires_attention_mask = "encoder_outputs" not in model_kwargs
+        kwargs_has_attention_mask = model_kwargs.get("attention_mask", None) is not None
+
+        # 3. Define model inputs
+        inputs_tensor, model_input_name, model_kwargs = self.model._prepare_model_inputs(
+            inputs, generation_config.bos_token_id, model_kwargs
+        )
+        batch_size = inputs_tensor.shape[0]
+
+        device = inputs_tensor.device
+        self.model._prepare_special_tokens(generation_config, kwargs_has_attention_mask, device=device)
+
+        # decoder-only models must use left-padding for batched generation.
+        if not self.model.config.is_encoder_decoder and not is_torchdynamo_compiling():
+            # If `input_ids` was given, check if the last id in any sequence is `pad_token_id`
+            # Note: If using, `inputs_embeds` this check does not work, because we want to be more hands-off.
+            if (
+                generation_config.pad_token_id is not None
+                and batch_size > 1
+                and len(inputs_tensor.shape) == 2
+                and torch.sum(inputs_tensor[:, -1] == generation_config.pad_token_id) > 0
+            ):
+                logging.warning(
+                    "A decoder-only architecture is being used, but right-padding was detected! For correct "
+                    "generation results, please set `padding_side='left'` when initializing the tokenizer."
+                )
+
+        # 4. Define other model kwargs
+        # decoder-only models with inputs_embeds forwarding must use caching (otherwise we can't detect whether we are
+        # generating the first new token or not, and we only want to use the embeddings for the first new token)
+        if not self.model.config.is_encoder_decoder and model_input_name == "inputs_embeds":
+            model_kwargs["use_cache"] = True
+        else:
+            model_kwargs["use_cache"] = generation_config.use_cache
+
+        if not kwargs_has_attention_mask and requires_attention_mask and accepts_attention_mask:
+            model_kwargs["attention_mask"] = self.model._prepare_attention_mask_for_generation(
+                inputs_tensor, generation_config.pad_token_id, generation_config.eos_token_id
+            )
+
+        if self.model.config.is_encoder_decoder and "encoder_outputs" not in model_kwargs:
+            # if model is encoder decoder encoder_outputs are created and added to `model_kwargs`
+            model_kwargs = self.model._prepare_encoder_decoder_kwargs_for_generation(
+                inputs_tensor, model_kwargs, model_input_name, generation_config
+            )
+
+        # 5. Prepare `input_ids` which will be used for auto-regressive generation
+        if self.model.config.is_encoder_decoder:
+            input_ids, model_kwargs = self.model._prepare_decoder_input_ids_for_generation(
+                batch_size=batch_size,
+                model_input_name=model_input_name,
+                model_kwargs=model_kwargs,
+                decoder_start_token_id=generation_config.decoder_start_token_id,
+                device=inputs_tensor.device,
+            )
+        else:
+            input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
+        return input_ids, model_kwargs
+    
+
     def _id2token(self, id):
         return self.tokenizer.convert_ids_to_tokens([id])[0]
 
     def _token2id(self, token):
         return self.tokenizer.convert_tokens_to_ids([token])[0]
-
-    def _init_decoding(self, input_ids, attention_mask):
-        # logging.info(input_ids)
-        if isinstance(self.model, PeftModelForCausalLM):
-            decoding_ids = torch.tensor([[self.tokenizer.bos_token_id]], dtype=torch.long, device=self.device)
-            outputs: CausalLMOutputWithPast = self.model(
-                input_ids = input_ids[:,:-1],           # important: remove </s>
-                attention_mask = attention_mask[:,:-1], # important: remove </s>
-                return_dict = True
-            )
-            encoder_outputs = None
-        elif isinstance(self.model, T5ForConditionalGeneration):
-            decoding_ids = torch.tensor([[self.model.generation_config.decoder_start_token_id]], dtype=torch.long, device=self.device)
-            outputs: Seq2SeqLMOutput = self.model(
-                input_ids = input_ids,
-                attention_mask = attention_mask,
-                decoder_input_ids = decoding_ids,
-                output_hidden_states = True,
-                return_dict = True
-            )
-            encoder_outputs = BaseModelOutput(
-                last_hidden_state=outputs.encoder_last_hidden_state,
-                hidden_states=None,
-                attentions=None,
-            )
-        logits = outputs.logits[:,-1,:]
-        probs = torch.softmax(logits, -1).view(-1)
-        best_idx = torch.argmax(probs, dim=-1, keepdim=False)
-        decoding_ids = torch.cat([decoding_ids, best_idx.unsqueeze(0).unsqueeze(0)], -1)
-        past_key_values = outputs.past_key_values
-        best_prob = probs[best_idx]
-        best_score = torch.log(best_prob)
-        return encoder_outputs, decoding_ids, past_key_values, best_prob.item(), best_score.item()
-    
-    def _model_forward(self, decoding_ids, attention_mask, past_key_values, encoder_outputs=None) -> Union[CausalLMOutputWithPast,Seq2SeqLMOutput]:
-        # logging.info(decoding_ids)
-        if isinstance(self.model, PeftModelForCausalLM):
-            outputs: CausalLMOutputWithPast = self.model(
-                input_ids = decoding_ids[:,-1:],
-                past_key_values = past_key_values,
-                return_dict = True
-            )
-        elif isinstance(self.model, T5ForConditionalGeneration):
-            encoder_outputs = BaseModelOutput(
-                last_hidden_state=encoder_outputs.last_hidden_state.repeat(decoding_ids.size(0), 1, 1),
-                hidden_states=None,
-                attentions=None,
-            )
-            outputs: Seq2SeqLMOutput = self.model(
-                encoder_outputs = encoder_outputs,
-                attention_mask = attention_mask,
-                decoder_input_ids = decoding_ids[:,-1:],
-                past_key_values = past_key_values,
-                return_dict = True
-            )
-        return outputs
-
-    def _lsp_step(
-            self,
-            all_cands,
-            decoding_ids,
-            attention_mask,
-            encoder_outputs,
-            past_key_values,
-            logits_processor,
-            token_threshold=0.2,
-            token_k=5,
-            temperature=0.6
-        ):
-
-        if token_k:
-            token_k = min(token_k, len(self.tokenizer))
-
-        trie = Trie()
-        for cand in all_cands:
-            trie.insert([self._token2id(t) for t in self.tokenizer.tokenize(cand)])
-        pending_node = trie.root
-
-        best_prob, best_score = 0, 0
-
-        step = 0
-        while True:
-            if pending_node.is_end_of_sequence and pending_node.is_valid:
-                return decoding_ids, past_key_values, best_prob, best_score
-            children = pending_node.get_children()
-
-            outputs = self._model_forward(decoding_ids, attention_mask, past_key_values, encoder_outputs)
-            logits = outputs.logits[:,-1,:].view(-1)
-            
-            tau = torch.ones_like(logits, device=self.device)
-            tau[[node.key for node in children]] = 1 / temperature
-            logits *= tau
-            
-            probs = torch.softmax(logits, -1)
-            log_probs = torch.log(probs)
-            
-            children.sort(key=lambda child: probs[child.key].item(), reverse=True)
-            for child in children[:5]:
-                logging.info('\t' * step + f"token: {self._id2token(child.key)}, prob: {probs[child.key].item()}")
-            if token_k:
-                topk_probs, topk_idxs = probs.topk(token_k, -1, True, True)
-                topk_idxs = {_idx.item() for _idx in topk_idxs}
-                topk_tokens_with_probs = [(self._id2token(_idx.item()), round(_prob.item(), 4)) for _prob, _idx in zip(topk_probs, topk_idxs)]
-                topk_tokens_with_probs.sort(key=lambda x: x[-1], reverse=True)
-            
-            pending_node = children[0]
-            if probs[pending_node.key].item() < token_threshold or (token_k and pending_node.key not in topk_idxs):
-                logging.info("\t\tNo valid candidates")
-                return None, None, None, None
-            decoding_ids = torch.cat([decoding_ids, torch.tensor([[pending_node.key]], dtype=torch.long, device=self.device)], -1)
-            past_key_values = outputs.past_key_values
-            best_prob = probs[pending_node.key].item()
-            best_score += log_probs[pending_node.key].item()
-            step += 1
     
     def update_lsp_project(self, pj_path, py_env=None):
         if self.jedi_pj is None or self.jedi_pj._path != pj_path:
             self.jedi_pj: jedi.Project = jedi.Project(pj_path, environment_path=py_env, added_sys_path=(pj_path,))
-
-    def get_lsp_context(self, file_path: str, func_code:str):
-        with Path(file_path).open("r") as f:
-            code = f.read()
-        try:
-            tree = ast.parse(code)
-        except Exception as e:
-            return None, None, None
-        funcs = (func for func in ast.walk(tree) if isinstance(func, ast.FunctionDef))
-        
-        for func in funcs:
-            func_source = ast.get_source_segment(code, func)
-            line, column = func.lineno, func.col_offset
-            rest_source = code.replace(func_source, "<PLACEHOLDER>")
-            _, tokens = DataAugmentor.tokenize_func(func_source)
-            original_func = "".join(tokens).replace(PLM_LSP_POINT, "<unk>").strip()
-            if original_func == func_code.replace(PLM_LSP_POINT, "").strip():
-                return rest_source, line, column
-        return None, None, None
     
     def get_lsp_completions(self, func, file_path, code_context, line, column):
         lines = func.split("\n")
@@ -309,124 +363,12 @@ class Generator:
         except Exception as e:
             completions = []
         completions = [completion.complete.strip() for completion in completions]
+        # completions = [
+        #     completion for completion in completions if len(completion) > 0 and completion not in SKIPPED
+        # ]
         completions = [
-            completion for completion in completions if len(completion) > 0 and completion not in SKIPPED
+            completion for completion in completions if len(completion) > 0
         ]
+        if all(comp in SKIPPED for comp in completions):
+            return []
         return completions
-    
-
-    def evaluate(
-            self,
-            eval_set,
-            batch_size=32,
-            max_len=256,
-            lsp_threshold=0.8,
-            token_threshold=0.2,
-            token_k=5,
-            temperature=0.6,
-            repetition_penalty=1.0,
-            record_file=None,
-            call_lsp=False
-        ):
-        predictions = []
-        if not call_lsp:
-            batch_ranges = list(zip(range(0, len(eval_set), batch_size), range(batch_size, len(eval_set)+batch_size, batch_size)))
-            for beg, end in tqdm(batch_ranges, ascii=True, desc="Evaluation"):
-                batch = eval_set[beg:end]
-                _, _, docstrs, signatures, _ = zip(*batch)
-                outputs = self.generate_simple(docstrs, signatures, max_len=max_len + 48, repetition_penalty=repetition_penalty)
-                predictions.extend(outputs)
-        else:
-            for repo, file_path, docstr, signature, code in tqdm(eval_set, ascii=True, desc="Evaluation"):
-                self.update_lsp_project(repo)
-                context, line, column = self.get_lsp_context(file_path, code)
-                if context is None:
-                    logging.error("failed to get lsp context.\n{code}")
-                    output = self.generate_simple([docstr], [signature], max_len=max_len + 48, repetition_penalty=repetition_penalty)[0]
-                else:
-                    logging.info(f"====================================")
-                    logging.info(f"[EXPECTATION]\n{code.strip()}")
-                    output = self.generate_with_lsp(docstr, signature, file_path, context, line, column, max_len, lsp_threshold, token_threshold, token_k, temperature, repetition_penalty)
-                predictions.append(output)
-        
-        if record_file is not None:
-            record_f = Path(record_file).open("w")
-
-        total_lsp_count, hit_lsp_count = 0, 0
-        noerror_count = 0
-        infos = []
-        for (repo, file_path, docstr, signature, expt), pred in tqdm(zip(eval_set, predictions), desc="Calculating", total=len(eval_set), ascii=True):
-            info = f"======================\n[PROMPT]:\n{docstr}\n[Signature]:\n{signature}\n[EXPECTATION]:\n{expt}\n[PREDICTION]:\n{pred}\n"
-            key_eles = set()
-            for mobj in re.finditer(r"%s(\w+)(\W|$)" % re.escape(PLM_LSP_POINT), expt):
-                key_ele = mobj.group(1).strip()
-                if len(key_ele) == 0:
-                    continue
-                if re.search(r"\s+%s\s*=" % re.escape(key_ele), expt):
-                    continue
-                if re.search(r"as\s+%s\s*:" % re.escape(key_ele), expt):
-                    continue
-                if re.search(r"for\s+\W*%s\W*\s+in" % re.escape(key_ele), expt):
-                    continue
-                if re.search(r"(\W|^)%s(\W|$)" % re.escape(key_ele), signature):
-                    continue
-                key_eles.add(key_ele)
-            for key_ele in key_eles:
-                total_lsp_count += 1
-                if re.search(r"(\W|^)%s(\W|$)" % re.escape(key_ele), clean_str(pred)):
-                    hit_lsp_count += 1
-                    info = f"{info}(√) {key_ele}\n"
-                else:
-                    info = f"{info}(x) {key_ele}\n"
-            infos.append(info)
-            
-            context, start_line, _ = self.get_lsp_context(file_path, expt)
-            end_line = start_line + len(pred.split("\n"))
-            context = context.replace("<PLACEHOLDER>", clean_lsp(pred))
-            tmp_py = f"{file_path[:-3]}_{''.join(random.choice(string.ascii_letters + string.digits) for _ in range(10))}.py"
-            tmp_json = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(10)) + ".json"
-            with Path(tmp_py).open("w") as f:
-                f.write(context)
-            command = ["pylint", "--disable=C,R,W", f"--output-format=json:{tmp_json}", tmp_py]
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = process.communicate()
-            errors = []
-            if len(stderr.decode().strip()) > 0:
-                logging.error(f"error when pylint\n{stderr.decode()}")
-            else:
-                with Path(tmp_json).open("r") as f:
-                    error_content = f.read().strip()
-                if len(error_content) > 0:
-                    errors = json.loads(error_content)
-            for err_item in errors:
-                if err_item["line"] >= start_line and err_item["line"] <= end_line:
-                    infos.append(f"[error] {err_item['message']}")
-                    break
-            else:
-                noerror_count += 1
-
-            os.unlink(tmp_py)
-            os.unlink(tmp_json)
-
-            if record_file is not None and len(infos) % 100 == 0:
-                record_f.write("\n".join(infos))
-                infos = []
-
-        if record_file is not None and len(infos) > 0:
-            record_f.write("\n".join(infos))
-        record_f.close()
-
-        logging.info(f"total lsp count: {total_lsp_count}, hit lsp count: {hit_lsp_count}")
-        logging.info(f"total func count: {len(eval_set)}, no-error func count: {noerror_count}")
-        lsp_hit = hit_lsp_count / total_lsp_count if total_lsp_count > 0 else 0
-        noerror_rate = noerror_count / len(eval_set)
-
-        predictions = [clean_lsp(code) for code in predictions]
-        expectations = [clean_lsp(expt) for repo, file_path, docstr, signature, expt in eval_set]
-        codebleu = CodeBleu.compute_codebleu(expectations, predictions)
-
-        predictions = [self.tokenizer.tokenize(code) for code in predictions]
-        expectations = [self.tokenizer.tokenize(code) for code in expectations]
-        bleu = Bleu.compute_bleu(expectations, predictions, smooth=True)
-
-        return bleu, codebleu, lsp_hit, noerror_rate

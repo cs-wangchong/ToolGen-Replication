@@ -1,0 +1,14 @@
+torch
+transformers
+peft
+accelerate
+bitsandbytes
+sentencepiece
+protobuf
+tensorboardX
+tensorboard
+tree-sitter
+fuzzywuzzy
+python-Levenshtein
+jedi
+pylint

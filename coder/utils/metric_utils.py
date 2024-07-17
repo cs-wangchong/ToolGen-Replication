@@ -103,7 +103,7 @@ class CodeBleu:
         ngram_match_score = ngram_corpus_bleu(tokenized_refs, tokenized_cands)
 
         # calculate weighted ngram match
-        keywords = [x.strip() for x in (Path(__file__).parent / "codebleu/keywords/java.txt").open('r', encoding='utf-8').readlines()]
+        keywords = [x.strip() for x in (Path(__file__).parent / f"codebleu/keywords/{lang}.txt").open('r', encoding='utf-8').readlines()]
         tokenized_refs_with_weights = [[[reference_tokens, CodeBleu.make_weights(reference_tokens, keywords)]\
                     for reference_tokens in reference] for reference in tokenized_refs]
         weighted_ngram_match_score = weighted_ngram_corpus_bleu(tokenized_refs_with_weights,tokenized_cands)

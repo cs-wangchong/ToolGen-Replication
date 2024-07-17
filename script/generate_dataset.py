@@ -9,7 +9,9 @@ from transformers import RobertaTokenizer
 from tqdm import tqdm
 import random
 from multiprocessing import Pool
+import ast
 
+from coder.data_augmentor import DataAugmentor
 from coder.constants import *
 
 def clean_docstring(docstring):
@@ -82,6 +84,38 @@ def validate_code(code):
     #     return False
     return True
 
+def validate_body(body:str):
+    body = body.strip()
+    if body == "raise NotImplementedError":
+        return False
+    if body == "raise NotImplementedError()":
+        return False
+    if body == "pass":
+        return False
+    if body == "return":
+        return False
+    return True
+
+def get_lsp_context(file_path: str, signature:str):
+    try:
+        with Path(file_path).open("r") as f:
+            code = f.read()
+        tree = ast.parse(code)
+    except Exception as e:
+        return None, None, None
+    funcs = (func for func in ast.walk(tree) if isinstance(func, ast.FunctionDef))
+    
+    for func in funcs:
+        func_source = ast.get_source_segment(code, func)
+        line, column = func.lineno, func.col_offset
+        context = code.replace(func_source, "<PLACEHOLDER>")
+        _, tokens = DataAugmentor.tokenize_func(func_source)
+        original_func = "".join(tokens).replace(PLM_LSP_POINT, "<unk>").strip()
+
+        if re.search(r"def\s+%s" % re.escape(signature), original_func):
+            return context, line, column
+    return None, None, None
+
 def handle(jsonl_path:str, max_len=128, tokenizer_name="Salesforce/codet5p-220m-py"):
     REPO_PATTERN = re.compile(r"/([^/]+#[^/]+)/")
 
@@ -92,7 +126,7 @@ def handle(jsonl_path:str, max_len=128, tokenizer_name="Salesforce/codet5p-220m-
     too_long_count = 0
     
     tokenizer = RobertaTokenizer.from_pretrained(tokenizer_name)
-    
+    counter = 0
     for line in tqdm(Path(jsonl_path).open("r").readlines(), ascii=True):
         d = json.loads(line.strip())
         repo = REPO_PATTERN.search(d["file_path"]).group(1).replace("#", "/")
@@ -105,19 +139,35 @@ def handle(jsonl_path:str, max_len=128, tokenizer_name="Salesforce/codet5p-220m-
         code = clean_code(code)
         if not validate_code(code):
             continue
+        code: str
 
-        signature = re.search(r"def\s+(%s\s*\(.*?\)(\s*->.*?)?):" % re.escape(d['function_name']), code, re.M|re.S)
+        signature = re.search(r"def\s+(%s\s*\(.*?\)(\s*->.*?)?:)" % re.escape(d['function_name']), code, re.M|re.S)
         if signature is None:
             continue
         signature = signature.group(1)
 
+        context, line, column = get_lsp_context(d["file_path"], signature)
+        if context is None:
+            continue
+        
+        idx = code.index(signature) + len(signature)
+        prefix = code[:idx]
+        body = "\n".join(line for line in code[idx:].split("\n") if line.strip() != "")
+        indent = re.match(r"\s*", body.split("\n")[0]).group(0)
+        prefix = f"{prefix}\n{indent}'''{docstring}'''\n"
+
+        if not validate_body(body):
+            continue
+
         augmented_code = d["augmented_code"]
         augmented_code = augmented_code.replace(PLM_LSP_POINT, "<unk>")
-        augmented_signature = re.search(r"def\s+((%s)\s*\((.*?)\)(\s*->.*?)?):" % re.escape(d['function_name']), augmented_code, re.M|re.S)
+        augmented_signature = re.search(r"def\s+((%s)\s*\((.*?)\)(\s*->.*?)?:)" % re.escape(d['function_name']), augmented_code, re.M|re.S)
         if augmented_signature is None:
             continue
         augmented_signature = augmented_signature.group(1)
         augmented_code = augmented_code.replace(augmented_signature, signature)
+        if signature not in augmented_code:
+            continue
 
         code_len = len(tokenizer.tokenize(code))
         if code_len > max_len:
@@ -140,55 +190,64 @@ def handle(jsonl_path:str, max_len=128, tokenizer_name="Salesforce/codet5p-220m-
         augmented_code = re.sub(r"<LSP-POINT-\d+>", PLM_LSP_POINT, augmented_code)
         augmented_code = clean_code(augmented_code)
 
+        idx = augmented_code.index(signature) + len(signature)
+        augmented_prefix = augmented_code[:idx]
+        augmented_body = "\n".join(line for line in augmented_code[idx:].split("\n") if line.strip() != "")
+        augmented_indent = re.match(r"\s*", augmented_body.split("\n")[0]).group(0)
+        augmented_prefix = f"{augmented_prefix}\n{augmented_indent}'''{docstring}'''\n"
+
         lsp_count = augmented_code.count(PLM_LSP_POINT)
 
-        prompt = f"Description: {docstring}\nFunction Signature: {signature}"
+        signature = signature.strip(" :")
 
         if repo in train_repos:
-            train_examples.append((prompt, code, doc_len, code_len))
-            augmented_train_examples.append((prompt, augmented_code, lsp_count))
+            train_examples.append((docstring, signature, code, prefix, body, doc_len, code_len))
+            augmented_train_examples.append((docstring, signature, augmented_code, augmented_prefix, augmented_body, lsp_count))
         elif repo in valid_repos:
-            valid_examples.append((prompt, code, doc_len, code_len))
-            augmented_valid_examples.append((prompt, augmented_code, lsp_count))
+            valid_examples.append((docstring, signature, code, prefix, body, doc_len, code_len))
+            augmented_valid_examples.append((docstring, signature, augmented_code, augmented_prefix, augmented_body, lsp_count))
         elif repo in test_repos:
-            test_examples.append((prompt, code, doc_len, code_len))
-            augmented_test_examples.append((prompt, augmented_code, lsp_count))
-            lsp_test_examples.append((repo, d["file_path"], prompt, augmented_code))
+            test_examples.append((docstring, signature, code, prefix, body, doc_len, code_len))
+            augmented_test_examples.append((docstring, signature, augmented_code, augmented_prefix, augmented_body, lsp_count))
+            lsp_test_examples.append((repo, d["file_path"], context, line, column, docstring, signature, augmented_code, augmented_prefix, augmented_body))
+        counter += 1
+        # if counter > 20:
+        #     break
     return (
-            train_examples,
-            valid_examples,
-            test_examples,
-            augmented_train_examples,
-            augmented_valid_examples,
-            augmented_test_examples,
-            lsp_test_examples,
-            kept_count,
-            too_long_count,
-            )
+        train_examples,
+        valid_examples,
+        test_examples,
+        augmented_train_examples,
+        augmented_valid_examples,
+        augmented_test_examples,
+        lsp_test_examples,
+        kept_count,
+        too_long_count,
+    )
 
     
 
 
 if __name__ == '__main__':
-    # train_repos, valid_repos, test_repos = set(), set(), set()
-    # for jsonl in Path("CodeSearchNet/resources/data/python/final/jsonl/train").rglob("*.jsonl"):
-    #     for line in jsonl.open("r"):
-    #         d = json.loads(line.strip())
-    #         train_repos.add(d["repo"])
-    # for jsonl in Path("CodeSearchNet/resources/data/python/final/jsonl/valid").rglob("*.jsonl"):
-    #     for line in jsonl.open("r"):
-    #         d = json.loads(line.strip())
-    #         valid_repos.add(d["repo"])
-    # for jsonl in Path("CodeSearchNet/resources/data/python/final/jsonl/test").rglob("*.jsonl"):
-    #     for line in jsonl.open("r"):
-    #         d = json.loads(line.strip())
-    #         test_repos.add(d["repo"])
-    # with Path("data/datasets/train_repos.json").open("w") as f:
-    #     json.dump(list(train_repos), f, indent=4)
-    # with Path("data/datasets/valid_repos.json").open("w") as f:
-    #     json.dump(list(valid_repos), f, indent=4)
-    # with Path("data/datasets/test_repos.json").open("w") as f:
-    #     json.dump(list(test_repos), f, indent=4)
+    train_repos, valid_repos, test_repos = set(), set(), set()
+    for jsonl in Path("CodeSearchNet/resources/data/python/final/jsonl/train").rglob("*.jsonl"):
+        for line in jsonl.open("r"):
+            d = json.loads(line.strip())
+            train_repos.add(d["repo"])
+    for jsonl in Path("CodeSearchNet/resources/data/python/final/jsonl/valid").rglob("*.jsonl"):
+        for line in jsonl.open("r"):
+            d = json.loads(line.strip())
+            valid_repos.add(d["repo"])
+    for jsonl in Path("CodeSearchNet/resources/data/python/final/jsonl/test").rglob("*.jsonl"):
+        for line in jsonl.open("r"):
+            d = json.loads(line.strip())
+            test_repos.add(d["repo"])
+    with Path("data/datasets/train_repos.json").open("w") as f:
+        json.dump(list(train_repos), f, indent=4)
+    with Path("data/datasets/valid_repos.json").open("w") as f:
+        json.dump(list(valid_repos), f, indent=4)
+    with Path("data/datasets/test_repos.json").open("w") as f:
+        json.dump(list(test_repos), f, indent=4)
 
 
     with Path("data/datasets/train_repos.json").open("r") as f:
@@ -237,9 +296,9 @@ if __name__ == '__main__':
         kept_count += _kept_count
         too_long_count += _too_long_count
     
-    train_tuples = [(prompt, code, augmented_code, doc_len, code_len, lsp_count) for (prompt, code, doc_len, code_len), (_, augmented_code, lsp_count) in zip(train_examples, augmented_train_examples)]
-    valid_tuples = [(prompt, code, augmented_code, doc_len, code_len, lsp_count) for (prompt, code, doc_len, code_len), (_, augmented_code, lsp_count) in zip(valid_examples, augmented_valid_examples)]
-    test_tuples = [(prompt, code, augmented_code, doc_len, code_len, lsp_count) for (prompt, code, doc_len, code_len), (_, augmented_code, lsp_count) in zip(test_examples, augmented_test_examples)]
+    train_tuples = [(docstring, signature, code, prefix, body, augmented_code, augmented_prefix, augmented_body, doc_len, code_len, lsp_count) for (docstring, signature, code, prefix, body, doc_len, code_len), (_, _, augmented_code, augmented_prefix, augmented_body, lsp_count) in zip(train_examples, augmented_train_examples)]
+    valid_tuples = [(docstring, signature, code, prefix, body, augmented_code, augmented_prefix, augmented_body, doc_len, code_len, lsp_count) for (docstring, signature, code, prefix, body, doc_len, code_len), (_, _, augmented_code, augmented_prefix, augmented_body, lsp_count) in zip(valid_examples, augmented_valid_examples)]
+    test_tuples = [(docstring, signature, code, prefix, body, augmented_code, augmented_prefix, augmented_body, doc_len, code_len, lsp_count) for (docstring, signature, code, prefix, body, doc_len, code_len), (_, _, augmented_code, augmented_prefix, augmented_body, lsp_count) in zip(test_examples, augmented_test_examples)]
     random.shuffle(train_tuples)
 
     train_examples, augmented_train_examples = [], []
@@ -247,45 +306,45 @@ if __name__ == '__main__':
     train_doc_len = 0
     train_code_len = 0
     train_lsp_count = 0
-    for prompt, code, augmented_code, doc_len, code_len, lsp_count in train_tuples:
-        if prompt in visited_train_prompts:
+    for docstring, signature, code, prefix, body, augmented_code, augmented_prefix, augmented_body, doc_len, code_len, lsp_count in train_tuples:
+        if (docstring, signature) in visited_train_prompts:
             continue
-        visited_train_prompts.add(prompt)
+        visited_train_prompts.add((docstring, signature))
         train_doc_len += doc_len
         train_code_len += code_len
         train_lsp_count += lsp_count
 
-        train_examples.append((prompt, code))
-        augmented_train_examples.append((prompt, augmented_code))
+        train_examples.append((docstring, signature, code, prefix, body))
+        augmented_train_examples.append((docstring, signature, augmented_code, augmented_prefix, augmented_body))
 
 
     valid_examples, augmented_valid_examples = [], []
     valid_doc_len = 0
     valid_code_len = 0
     valid_lsp_count = 0
-    for prompt, code, augmented_code, doc_len, code_len, lsp_count in valid_tuples:
-        if prompt in visited_train_prompts:
+    for docstring, signature, code, prefix, body, augmented_code, augmented_prefix, augmented_body, doc_len, code_len, lsp_count in valid_tuples:
+        if (docstring, signature) in visited_train_prompts:
             continue
         valid_doc_len += doc_len
         valid_code_len += code_len
         valid_lsp_count += lsp_count
-        valid_examples.append((prompt, code))
-        augmented_valid_examples.append((prompt, augmented_code))
+        valid_examples.append((docstring, signature, code, prefix, body))
+        augmented_valid_examples.append((docstring, signature, augmented_code, augmented_prefix, augmented_body))
 
     test_examples, augmented_test_examples = [], []
     test_doc_len = 0
     test_code_len = 0
     test_lsp_count = 0
-    for prompt, code, augmented_code, doc_len, code_len, lsp_count in test_tuples:
-        if prompt in visited_train_prompts:
+    for docstring, signature, code, prefix, body, augmented_code, augmented_prefix, augmented_body, doc_len, code_len, lsp_count in test_tuples:
+        if (docstring, signature) in visited_train_prompts:
             continue
         test_doc_len += doc_len
         test_code_len += code_len
         test_lsp_count += lsp_count
-        test_examples.append((prompt, code))
-        augmented_test_examples.append((prompt, augmented_code))
+        test_examples.append((docstring, signature, code, prefix, body))
+        augmented_test_examples.append((docstring, signature, augmented_code, augmented_prefix, augmented_body))
 
-    lsp_test_examples = [(repo, path, prompt, code) for repo, path, prompt, code in lsp_test_examples if prompt not in visited_train_prompts]
+    lsp_test_examples = [(repo, path, context, line, column, docstring, signature, code, prefix, body) for repo, path, context, line, column, docstring, signature, code, prefix, body in lsp_test_examples if (docstring, signature) not in visited_train_prompts]
 
     with Path("data/datasets/meta_info.txt").open("w") as f:
         f.write(f"dataset sizes: {len(train_examples)}, {len(valid_examples)}, {len(test_examples)}\n")
@@ -337,7 +396,7 @@ if __name__ == '__main__':
         pickle.dump(list(augmented_valid_examples), f)
     with Path("data/datasets/augmented-test.bin").open("wb") as f:
         pickle.dump(list(augmented_test_examples), f)
-
+    
     with Path("data/datasets/train.json").open("w") as f:
         json.dump(list(train_examples), f, indent=4)
     with Path("data/datasets/valid.json").open("w") as f:
@@ -352,6 +411,34 @@ if __name__ == '__main__':
     with Path("data/datasets/augmented-test.json").open("w") as f:
         json.dump(list(augmented_test_examples), f, indent=4)
 
+
+    train_examples = random.sample(train_examples, 50000)
+    valid_examples = random.sample(valid_examples, 3000)
+
+    augmented_train_examples = random.sample(augmented_train_examples, 50000)
+    augmented_valid_examples = random.sample(augmented_valid_examples, 3000)
+
+    with Path("data/datasets/train-sample50000.bin").open("wb") as f:
+        pickle.dump(list(train_examples), f)
+    with Path("data/datasets/valid-sample3000.bin").open("wb") as f:
+        pickle.dump(list(valid_examples), f)
+
+    with Path("data/datasets/augmented-train-sample50000.bin").open("wb") as f:
+        pickle.dump(list(augmented_train_examples), f)
+    with Path("data/datasets/augmented-valid-sample3000.bin").open("wb") as f:
+        pickle.dump(list(augmented_valid_examples), f)
+    
+    with Path("data/datasets/train-sample50000.json").open("w") as f:
+        json.dump(list(train_examples), f, indent=4)
+    with Path("data/datasets/valid-sample3000.json").open("w") as f:
+        json.dump(list(valid_examples), f, indent=4)
+
+    with Path("data/datasets/augmented-train-sample50000.json").open("w") as f:
+        json.dump(list(augmented_train_examples), f, indent=4)
+    with Path("data/datasets/augmented-valid-sample3000.json").open("w") as f:
+        json.dump(list(augmented_valid_examples), f, indent=4)
+
+
     with Path("data/datasets/lsp-test.bin").open("wb") as f:
         pickle.dump(list(lsp_test_examples), f)
     with Path("data/datasets/lsp-test.json").open("w") as f:
@@ -360,3 +447,16 @@ if __name__ == '__main__':
     lsp_test_examples = random.sample(lsp_test_examples, 100)
     with Path("data/datasets/lsp-test-sample100.bin").open("wb") as f:
         pickle.dump(lsp_test_examples, f)
+    with Path("data/datasets/lsp-test-sample100.json").open("w") as f:
+        json.dump(list(lsp_test_examples), f, indent=4)
+
+
+    with Path("data/datasets/lsp-test.bin").open("rb") as f:
+        lsp_test_examples = pickle.load(f)
+
+
+    lsp_test_examples = random.sample(lsp_test_examples, 100)
+    with Path("data/datasets/lsp-test-sample100.bin").open("wb") as f:
+        pickle.dump(lsp_test_examples, f)
+    with Path("data/datasets/lsp-test-sample100.json").open("w") as f:
+        json.dump(list(lsp_test_examples), f, indent=4)

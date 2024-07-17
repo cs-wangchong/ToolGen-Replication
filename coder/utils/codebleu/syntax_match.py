@@ -8,6 +8,13 @@ from .parser import (remove_comments_and_docstrings,
                    index_to_code_token,
                    tree_to_variable_index)
 from tree_sitter import Language, Parser
+import tree_sitter_python as tspython
+import tree_sitter_java as tsjava
+
+lang_ptrs = {
+    'python': tspython,
+    'java': tsjava,
+}
 
 dfg_function={
     'python':DFG_python,
@@ -22,10 +29,9 @@ dfg_function={
 def calc_syntax_match(references, candidate, lang):
     return corpus_syntax_match([references], [candidate], lang)
 
-def corpus_syntax_match(references, candidates, lang):   
-    JAVA_LANGUAGE = Language(str(Path(__file__).parent / 'parser/tree_sitter.so'), lang)
-    parser = Parser()
-    parser.set_language(JAVA_LANGUAGE)
+def corpus_syntax_match(references, candidates, lang):
+    PTR = lang_ptrs[lang].language()
+    parser = Parser(Language(PTR))
     match_count = 0
     total_count = 0
 
